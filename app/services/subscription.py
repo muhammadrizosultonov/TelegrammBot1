@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import logging
 
 from aiogram import Bot
 from aiogram.enums.chat_member_status import ChatMemberStatus
@@ -8,11 +9,15 @@ from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 
 from app.db import ChannelItem, Database
 
+logger = logging.getLogger(__name__)
 
 ALLOWED_STATUSES = {
     ChatMemberStatus.MEMBER,
     ChatMemberStatus.ADMINISTRATOR,
     ChatMemberStatus.CREATOR,
+    # Guruhlarda foydalanuvchi "restricted" bo'lsa ham a'zo hisoblanadi.
+    # (Ko'pincha yangi a'zolar vaqtincha yozishdan cheklanadi.)
+    ChatMemberStatus.RESTRICTED,
 }
 
 
@@ -38,8 +43,14 @@ async def check_user_subscriptions(
             member = await bot.get_chat_member(chat_id=channel.chat_id, user_id=user_id)
             if member.status not in ALLOWED_STATUSES:
                 missing.append(channel)
-        except (TelegramBadRequest, TelegramForbiddenError):
+        except (TelegramBadRequest, TelegramForbiddenError) as exc:
             # Chatga kira olmaslik holatida xavfsizlik uchun o'tkazmaymiz
+            logger.warning(
+                "get_chat_member xatosi | chat_id=%s user_id=%s error=%s",
+                channel.chat_id,
+                user_id,
+                exc,
+            )
             missing.append(channel)
 
     return SubscriptionCheckResult(

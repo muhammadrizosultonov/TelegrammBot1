@@ -252,14 +252,6 @@ async def _resolve_channel(
     bot: Bot | None,
     arg: str | None = None,
 ) -> tuple[int, str | None, str | None]:
-    if arg:
-        if arg.startswith("@"):
-            chat = await bot.get_chat(arg)
-            return chat.id, chat.title, (chat.username or "").lstrip("@") or None
-        chat_id = int(arg)
-        chat = await bot.get_chat(chat_id)
-        return chat.id, chat.title, (chat.username or "").lstrip("@") or None
-
     if message.forward_from_chat and message.forward_from_chat.type == "channel":
         chat = message.forward_from_chat
         return chat.id, chat.title, (chat.username or "").lstrip("@") or None
@@ -272,6 +264,19 @@ async def _resolve_channel(
     origin_chat = getattr(forward_origin, "chat", None)
     if origin_chat and getattr(origin_chat, "type", None) == "channel":
         return origin_chat.id, origin_chat.title, (origin_chat.username or "").lstrip("@") or None
+
+    if arg:
+        if bot is None:
+            raise ValueError("bot_required_for_arg")
+        value = arg.strip()
+        if not value:
+            raise ValueError("channel_arg_empty")
+        if value.startswith("@"):
+            chat = await bot.get_chat(value)
+            return chat.id, chat.title, (chat.username or "").lstrip("@") or None
+        chat_id = int(value)
+        chat = await bot.get_chat(chat_id)
+        return chat.id, chat.title, (chat.username or "").lstrip("@") or None
 
     raise ValueError("channel_source_not_found")
 
@@ -1059,9 +1064,11 @@ async def menu_delete_content_code(
 
 @router.message(F.forward_from_chat | F.sender_chat | F.forward_origin)
 async def suggest_channel_add_from_forward(
-    message: Message, settings: Settings, db: Database
+    message: Message, state: FSMContext, settings: Settings, db: Database
 ) -> None:
     if not await _require_admin_message(message, settings, db, None):
+        return
+    if await state.get_state():
         return
 
     try:
@@ -1083,6 +1090,7 @@ async def suggest_channel_add_from_forward(
 @router.callback_query(F.data.startswith("admin_ch_add:"))
 async def confirm_channel_add(
     callback: CallbackQuery,
+    state: FSMContext,
     settings: Settings,
     db: Database,
     bot: Bot,
@@ -1107,7 +1115,7 @@ async def confirm_channel_add(
 
     if action == "cancel":
         if callback.message:
-            await callback.message.edit_text("❎ Kanal qo'shish bekor qilindi.")
+            await callback.message.edit_text("❎ Kanal qo'shish bekor qilindi.", reply_markup=None)
         await callback.answer("Bekor qilindi")
         return
 
@@ -1119,7 +1127,6 @@ async def confirm_channel_add(
         chat = await bot.get_chat(chat_id)
         title = chat.title
         username = (chat.username or "").lstrip("@") or None
-        await db.add_channel(chat_id=chat_id, title=title, username=username, invite_link=None)
     except Exception as exc:
         logger.warning("Kanalni callback orqali qo'shishda xato: %s", exc)
         await callback.answer("Kanalni qo'shib bo'lmadi.", show_alert=True)
@@ -1127,10 +1134,29 @@ async def confirm_channel_add(
 
     if callback.message:
         channel_ref = _channel_ref(username, chat_id=chat_id)
+        if username:
+            await db.add_channel(chat_id=chat_id, title=title, username=username, invite_link=None)
+            await callback.message.edit_text(
+                "✅ <b>Kanal ro'yxatga qo'shildi</b>\n\n"
+                f"📛 Nomi: <b>{_safe(title, 'Nomsiz kanal')}</b>\n"
+                f"🔗 Manzil: {channel_ref}",
+                parse_mode="HTML",
+                reply_markup=None,
+            )
+            await callback.answer("Qo'shildi")
+            return
+
+        await state.update_data(chat_id=chat_id, title=title, username=username)
+        await state.set_state(AddChannelState.waiting_invite_link)
         await callback.message.edit_text(
-            "✅ <b>Kanal ro'yxatga qo'shildi</b>\n\n"
-            f"📛 Nomi: <b>{_safe(title, 'Nomsiz kanal')}</b>\n"
-            f"🔗 Manzil: {channel_ref}",
+            "🔒 <b>Private kanal aniqlandi</b>\n\n"
+            f"{_channel_card(chat_id, title, username)}\n\n"
+            "🔗 <b>Taklif havolasini yuboring</b>\n"
+            "Namuna: <code>https://t.me/+AbCdEf...</code>",
             parse_mode="HTML",
+            reply_markup=None,
         )
+        await callback.answer("Taklif havolasini yuboring")
+        return
+
     await callback.answer("Qo'shildi")

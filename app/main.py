@@ -7,7 +7,6 @@ from aiogram.types import ErrorEvent
 from app.config import Settings, get_settings
 from app.db import Database
 from app.handlers import admin, user
-from app.middlewares.rate_limit import RateLimitMiddleware
 
 
 def setup_logging() -> None:
@@ -44,10 +43,6 @@ async def main() -> None:
 
     bot = Bot(token=settings.bot_token)
     dp = Dispatcher()
-
-    rate_mw = RateLimitMiddleware(limit_seconds=settings.rate_limit_seconds)
-    dp.message.middleware(rate_mw)
-    dp.callback_query.middleware(rate_mw)
 
     dp.include_router(admin.router)
     dp.include_router(user.router)
