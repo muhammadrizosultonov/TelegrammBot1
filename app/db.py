@@ -212,7 +212,7 @@ class Database:
             await self._apply_pragmas(db)
             db.row_factory = aiosqlite.Row
             cursor = await db.execute(
-                "SELECT chat_id, title, username, invite_link FROM channels ORDER BY created_at DESC"
+                "SELECT chat_id, title, username, invite_link FROM channels ORDER BY created_at ASC"
             )
             rows = await cursor.fetchall()
 

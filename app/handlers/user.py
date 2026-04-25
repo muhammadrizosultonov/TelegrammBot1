@@ -4,6 +4,7 @@ import logging
 import re
 
 from aiogram import Bot, F, Router
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import CommandStart
 from aiogram.types import CallbackQuery, Message
 from app.config import Settings
@@ -111,6 +112,14 @@ async def recheck_subscription(callback: CallbackQuery, bot: Bot, db: Database) 
     if not callback.from_user:
         await callback.answer()
         return
+    # Callback query javobi qaytmasa Telegram UI'da "aylanib turish" davom etadi.
+    # Shuning uchun tekshiruvdan oldin javob berib yuboramiz.
+    try:
+        await callback.answer("🔄 Tekshirilmoqda...")
+    except TelegramBadRequest:
+        # Callback "eskirgan" bo'lishi mumkin. Bu holatda ham tekshiruvni davom ettiramiz.
+        pass
+
     await db.touch_user(
         user_id=callback.from_user.id,
         username=callback.from_user.username,
@@ -120,18 +129,24 @@ async def recheck_subscription(callback: CallbackQuery, bot: Bot, db: Database) 
     check = await check_user_subscriptions(bot=bot, db=db, user_id=callback.from_user.id)
     if not check.is_subscribed:
         if not callback.message:
-            await callback.answer("Obuna oynasi topilmadi.", show_alert=True)
+            await bot.send_message(callback.from_user.id, "Obuna oynasi topilmadi.")
             return
         template = await _get_text(db, "subscription_template")
-        await callback.message.edit_text(
-            build_subscription_message(check.missing_channels, template=template),
-            reply_markup=subscription_keyboard(check.missing_channels),
-        )
-        await callback.answer("Hali barcha kanallarga qo'shilmagansiz.", show_alert=False)
+        text = build_subscription_message(check.missing_channels, template=template)
+        markup = subscription_keyboard(check.missing_channels)
+        try:
+            await callback.message.edit_text(text, reply_markup=markup)
+        except TelegramBadRequest as exc:
+            # Text/markup o'zgarmagan bo'lsa Telegram "message is not modified" qaytaradi.
+            # Bu tekshiruvni to'xtatmasligi kerak.
+            if "message is not modified" not in str(exc):
+                await callback.message.answer(
+                    "⚠️ Obuna oynasini yangilab bo'lmadi. Bir ozdan so'ng qayta urinib ko'ring."
+                )
         return
 
-    await callback.answer("✅ Obuna tasdiqlandi", show_alert=False)
+    text = "🎉 Ajoyib, obuna tasdiqlandi!\n\nEndi kodni qayta yuboring va kontentni oling."
     if callback.message:
-        await callback.message.answer(
-            "🎉 Ajoyib, obuna tasdiqlandi!\n\nEndi kodni qayta yuboring va kontentni oling."
-        )
+        await callback.message.answer(text)
+    else:
+        await bot.send_message(callback.from_user.id, text)
