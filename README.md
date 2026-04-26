@@ -133,6 +133,7 @@ Muhim:
 
 - Botni majburiy kanallarga qo'shing.
 - Botga kanal a'zolarini ko'rish huquqi kerak (`administrator` qilib qo'ying).
+- Private kanal/guruhda botni admin qilib qo'shmasangiz, bot obunani tekshirolmaydi (invite link yetarli emas).
 - Private kanal uchun odatda `chat_id` bilan qo'shiladi (`-100...`).
 
 Admin bot ichida:

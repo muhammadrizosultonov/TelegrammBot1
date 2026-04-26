@@ -90,9 +90,14 @@ async def code_handler(message: Message, bot: Bot, db: Database, settings: Setti
     check = await check_user_subscriptions(bot=bot, db=db, user_id=message.from_user.id)
     if not check.is_subscribed:
         template = await _get_text(db, "subscription_template")
+        channels_for_keyboard = check.missing_channels + check.inaccessible_channels
         await message.answer(
-            build_subscription_message(check.missing_channels, template=template),
-            reply_markup=subscription_keyboard(check.missing_channels),
+            build_subscription_message(
+                check.missing_channels,
+                inaccessible_channels=check.inaccessible_channels,
+                template=template,
+            ),
+            reply_markup=subscription_keyboard(channels_for_keyboard),
         )
         return
 
@@ -132,8 +137,13 @@ async def recheck_subscription(callback: CallbackQuery, bot: Bot, db: Database) 
             await bot.send_message(callback.from_user.id, "Obuna oynasi topilmadi.")
             return
         template = await _get_text(db, "subscription_template")
-        text = build_subscription_message(check.missing_channels, template=template)
-        markup = subscription_keyboard(check.missing_channels)
+        text = build_subscription_message(
+            check.missing_channels,
+            inaccessible_channels=check.inaccessible_channels,
+            template=template,
+        )
+        channels_for_keyboard = check.missing_channels + check.inaccessible_channels
+        markup = subscription_keyboard(channels_for_keyboard)
         try:
             await callback.message.edit_text(text, reply_markup=markup)
         except TelegramBadRequest as exc:

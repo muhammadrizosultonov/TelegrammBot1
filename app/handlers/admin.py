@@ -6,6 +6,7 @@ import logging
 import re
 
 from aiogram import Bot, F, Router
+from aiogram.enums.chat_member_status import ChatMemberStatus
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
@@ -252,17 +253,17 @@ async def _resolve_channel(
     bot: Bot | None,
     arg: str | None = None,
 ) -> tuple[int, str | None, str | None]:
-    if message.forward_from_chat and message.forward_from_chat.type == "channel":
+    if message.forward_from_chat and message.forward_from_chat.type in {"channel", "supergroup", "group"}:
         chat = message.forward_from_chat
         return chat.id, chat.title, (chat.username or "").lstrip("@") or None
 
-    if message.sender_chat and message.sender_chat.type == "channel":
+    if message.sender_chat and message.sender_chat.type in {"channel", "supergroup", "group"}:
         chat = message.sender_chat
         return chat.id, chat.title, (chat.username or "").lstrip("@") or None
 
     forward_origin = getattr(message, "forward_origin", None)
     origin_chat = getattr(forward_origin, "chat", None)
-    if origin_chat and getattr(origin_chat, "type", None) == "channel":
+    if origin_chat and getattr(origin_chat, "type", None) in {"channel", "supergroup", "group"}:
         return origin_chat.id, origin_chat.title, (origin_chat.username or "").lstrip("@") or None
 
     if arg:
@@ -320,7 +321,7 @@ async def open_subscription_menu(message: Message, settings: Settings, db: Datab
         return
     await message.answer(
         "🔔 <b>Obuna sozlamalari</b>\n\n"
-        "Kanallarni ulash, olib tashlash yoki ro'yxatni shu bo'limdan boshqarasiz.",
+        "Kanal/guruhlarni ulash, olib tashlash yoki ro'yxatni shu bo'limdan boshqarasiz.",
         parse_mode="HTML",
         reply_markup=subscription_menu_keyboard(),
     )
@@ -334,8 +335,8 @@ async def menu_add_channel(
         return
     await state.set_state(AddChannelState.waiting_channel_id)
     await message.answer(
-        "➕ <b>Yangi kanal ulash</b>\n\n"
-        "Kanal postini forward qiling yoki <code>chat_id</code> yuboring.\n"
+        "➕ <b>Yangi kanal/guruh ulash</b>\n\n"
+        "Kanal/guruhdan postni forward qiling yoki <code>chat_id</code> yuboring.\n"
         "Private kanal odatda <code>-100</code> bilan boshlanadi.\n\n"
         "Ortga qaytish uchun <b>🏠 Asosiy panel</b> tugmasidan foydalaning.",
         parse_mode="HTML",
@@ -367,6 +368,32 @@ async def menu_add_channel_id(
         logger.warning("Kanalni qo'shishda xato: %s", exc)
         await message.answer(
             "🚫 Kanalni tekshirib bo'lmadi.\n\nBot shu kanalda admin ekanini tekshirib ko'ring."
+        )
+        return
+
+    # Majburiy obunani tekshirish uchun bot chatga kira olishi va admin bo'lishi kerak.
+    try:
+        me = await bot.get_me()
+        bot_member = await bot.get_chat_member(chat_id=chat_id, user_id=me.id)
+    except (TelegramBadRequest, TelegramForbiddenError):
+        await message.answer(
+            "🚫 <b>Kanal/guruhni ulab bo'lmadi</b>\n\n"
+            "Bot bu chatga kira olmayapti (ko'pincha bot admin qilib qo'shilmagan).\n\n"
+            f"{_channel_card(chat_id, title, username)}\n\n"
+            "✅ Yechim: shu kanal/guruh sozlamalaridan botni <b>administrator</b> qilib qo'shing, "
+            "keyin qayta urinib ko'ring.",
+            parse_mode="HTML",
+            reply_markup=subscription_menu_keyboard(),
+        )
+        return
+    if bot_member.status not in {ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.CREATOR}:
+        await message.answer(
+            "🚫 <b>Kanal/guruhni ulab bo'lmadi</b>\n\n"
+            "Majburiy obunani tekshirish uchun bot shu chatda <b>administrator</b> bo'lishi kerak.\n\n"
+            f"{_channel_card(chat_id, title, username)}\n\n"
+            "✅ Yechim: botni administrator qilib qo'ying, keyin qayta urinib ko'ring.",
+            parse_mode="HTML",
+            reply_markup=subscription_menu_keyboard(),
         )
         return
 
@@ -485,7 +512,7 @@ async def menu_delete_channel_id(
 
 
 @router.message(F.text.in_(SUB_LIST_ALIASES))
-async def menu_list_channels(message: Message, settings: Settings, db: Database) -> None:
+async def menu_list_channels(message: Message, settings: Settings, db: Database, bot: Bot) -> None:
     if not await _require_admin_message(message, settings, db):
         return
     channels = await db.list_channels()
@@ -496,8 +523,19 @@ async def menu_list_channels(message: Message, settings: Settings, db: Database)
         )
         return
 
+    me = await bot.get_me()
     lines = ["🔔 <b>Ulangan kanallar ro'yxati</b>", ""]
     for i, channel in enumerate(channels, start=1):
+        bot_access_text = "❌ bot chatga kira olmaydi"
+        try:
+            bot_member = await bot.get_chat_member(chat_id=channel.chat_id, user_id=me.id)
+            if bot_member.status in {ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.CREATOR}:
+                bot_access_text = "✅ bot admin (tekshiruv ishlaydi)"
+            else:
+                bot_access_text = f"⚠️ bot admin emas ({bot_member.status})"
+        except (TelegramBadRequest, TelegramForbiddenError):
+            bot_access_text = "❌ bot chatga kira olmaydi"
+
         lines.append(
             _channel_card(
                 channel.chat_id,
@@ -506,6 +544,7 @@ async def menu_list_channels(message: Message, settings: Settings, db: Database)
                 invite_link=channel.invite_link,
                 index=i,
             )
+            + f"\n🤖 {_safe(bot_access_text)}"
         )
         lines.append("")
 
@@ -1078,7 +1117,7 @@ async def suggest_channel_add_from_forward(
 
     channel_ref = _channel_ref(username, chat_id=chat_id)
     await message.answer(
-        "✨ <b>Kanal aniqlandi</b>\n\n"
+        "✨ <b>Kanal/guruh aniqlandi</b>\n\n"
         f"📛 Nomi: <b>{_safe(title, 'Nomsiz kanal')}</b>\n"
         f"🔗 Manzil: {channel_ref}\n\n"
         "Majburiy obuna ro'yxatiga qo'shaymi?",
@@ -1130,6 +1169,36 @@ async def confirm_channel_add(
     except Exception as exc:
         logger.warning("Kanalni callback orqali qo'shishda xato: %s", exc)
         await callback.answer("Kanalni qo'shib bo'lmadi.", show_alert=True)
+        return
+
+    # Majburiy obunani tekshirish uchun bot chatga kira olishi va admin bo'lishi kerak.
+    try:
+        me = await bot.get_me()
+        bot_member = await bot.get_chat_member(chat_id=chat_id, user_id=me.id)
+    except (TelegramBadRequest, TelegramForbiddenError):
+        if callback.message:
+            await callback.message.edit_text(
+                "🚫 <b>Kanal/guruhni ulab bo'lmadi</b>\n\n"
+                "Bot bu chatga kira olmayapti (ko'pincha bot admin qilib qo'shilmagan).\n\n"
+                f"{_channel_card(chat_id, title, username)}\n\n"
+                "✅ Yechim: shu kanal/guruh sozlamalaridan botni <b>administrator</b> qilib qo'shing, "
+                "keyin qayta urinib ko'ring.",
+                parse_mode="HTML",
+                reply_markup=None,
+            )
+        await callback.answer("Bot chatga kira olmayapti.", show_alert=True)
+        return
+    if bot_member.status not in {ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.CREATOR}:
+        if callback.message:
+            await callback.message.edit_text(
+                "🚫 <b>Kanal/guruhni ulab bo'lmadi</b>\n\n"
+                "Majburiy obunani tekshirish uchun bot shu chatda <b>administrator</b> bo'lishi kerak.\n\n"
+                f"{_channel_card(chat_id, title, username)}\n\n"
+                "✅ Yechim: botni administrator qilib qo'ying, keyin qayta urinib ko'ring.",
+                parse_mode="HTML",
+                reply_markup=None,
+            )
+        await callback.answer("Bot admin emas.", show_alert=True)
         return
 
     if callback.message:
