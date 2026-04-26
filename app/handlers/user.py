@@ -4,9 +4,9 @@ import logging
 import re
 
 from aiogram import Bot, F, Router
-from aiogram.exceptions import TelegramBadRequest
+from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 from aiogram.filters import CommandStart
-from aiogram.types import CallbackQuery, Message
+from aiogram.types import CallbackQuery, ChatJoinRequest, Message
 from app.config import Settings
 from app.db import Database
 from app.keyboards.inline import subscription_keyboard
@@ -63,6 +63,56 @@ async def _get_text(db: Database, key: str) -> str:
     return DEFAULT_TEXTS[key]
 
 
+@router.chat_join_request()
+async def track_join_request(join_request: ChatJoinRequest, bot: Bot, db: Database) -> None:
+    chat_id = join_request.chat.id
+    user = join_request.from_user
+    user_id = user.id
+
+    # Faqat majburiy obuna ro'yxatidagi chatlar uchun join request'larni hisobga olamiz.
+    if not await db.has_channel(chat_id):
+        return
+
+    await db.touch_user(user_id=user_id, username=user.username, full_name=user.full_name)
+    await db.upsert_join_request(
+        chat_id=chat_id,
+        user_id=user_id,
+        requested_at=join_request.date.isoformat(sep=" ", timespec="seconds"),
+    )
+
+    # Agar foydalanuvchi kontent kodini yuborgan bo'lsa, join request yetarli bo'lgan holatda
+    # kontentni avtomatik yuborib qo'yamiz.
+    pending_code = await db.get_pending_code(user_id)
+    if not pending_code:
+        return
+
+    check = await check_user_subscriptions(bot=bot, db=db, user_id=user_id)
+    if not check.is_subscribed:
+        return
+
+    content = await db.get_content(pending_code)
+    if not content:
+        await db.set_pending_code(user_id=user_id, code=None)
+        return
+
+    try:
+        if content.file_type == "video":
+            await bot.send_video(chat_id=user_id, video=content.file_id, caption=content.caption)
+        elif content.file_type == "document":
+            await bot.send_document(chat_id=user_id, document=content.file_id, caption=content.caption)
+        else:
+            await bot.send_message(user_id, "⚠️ Saqlangan kontent turi qo'llab-quvvatlanmaydi.")
+            return
+    except (TelegramBadRequest, TelegramForbiddenError):
+        await bot.send_message(
+            user_id,
+            "🚫 Kontentni yuborib bo'lmadi. Bot ruxsatlari yoki fayl holatini tekshirib ko'ring.",
+        )
+        return
+
+    await db.set_pending_code(user_id=user_id, code=None)
+
+
 @router.message(F.text & ~F.text.startswith("/"))
 async def code_handler(message: Message, bot: Bot, db: Database, settings: Settings) -> None:
     if not message.from_user:
@@ -89,6 +139,7 @@ async def code_handler(message: Message, bot: Bot, db: Database, settings: Setti
 
     check = await check_user_subscriptions(bot=bot, db=db, user_id=message.from_user.id)
     if not check.is_subscribed:
+        await db.set_pending_code(user_id=message.from_user.id, code=code)
         template = await _get_text(db, "subscription_template")
         channels_for_keyboard = check.missing_channels + check.inaccessible_channels
         await message.answer(
@@ -101,6 +152,7 @@ async def code_handler(message: Message, bot: Bot, db: Database, settings: Setti
         )
         return
 
+    await db.set_pending_code(user_id=message.from_user.id, code=None)
     content = await db.get_content(code)
     if not content:
         text = await _get_text(db, "code_not_found")
@@ -134,7 +186,18 @@ async def recheck_subscription(callback: CallbackQuery, bot: Bot, db: Database) 
     check = await check_user_subscriptions(bot=bot, db=db, user_id=callback.from_user.id)
     if not check.is_subscribed:
         if not callback.message:
-            await bot.send_message(callback.from_user.id, "Obuna oynasi topilmadi.")
+            template = await _get_text(db, "subscription_template")
+            text = build_subscription_message(
+                check.missing_channels,
+                inaccessible_channels=check.inaccessible_channels,
+                template=template,
+            )
+            channels_for_keyboard = check.missing_channels + check.inaccessible_channels
+            await bot.send_message(
+                callback.from_user.id,
+                text,
+                reply_markup=subscription_keyboard(channels_for_keyboard),
+            )
             return
         template = await _get_text(db, "subscription_template")
         text = build_subscription_message(
@@ -149,14 +212,72 @@ async def recheck_subscription(callback: CallbackQuery, bot: Bot, db: Database) 
         except TelegramBadRequest as exc:
             # Text/markup o'zgarmagan bo'lsa Telegram "message is not modified" qaytaradi.
             # Bu tekshiruvni to'xtatmasligi kerak.
-            if "message is not modified" not in str(exc):
+            if "message is not modified" in str(exc):
+                await callback.message.answer(
+                    "Hali barcha kanallarga qo'shilmagansiz. Obuna bo'lib, yana tekshirib ko'ring."
+                )
+            else:
                 await callback.message.answer(
                     "⚠️ Obuna oynasini yangilab bo'lmadi. Bir ozdan so'ng qayta urinib ko'ring."
                 )
         return
 
-    text = "🎉 Ajoyib, obuna tasdiqlandi!\n\nEndi kodni qayta yuboring va kontentni oling."
+    pending_code = await db.get_pending_code(callback.from_user.id)
+    if pending_code:
+        content = await db.get_content(pending_code)
+        if not content:
+            await db.set_pending_code(user_id=callback.from_user.id, code=None)
+            text = "✅ Obuna tasdiqlandi.\n\n❌ Lekin bu kod bo'yicha kontent topilmadi. Kodni qayta yuboring."
+            if callback.message:
+                await callback.message.answer(text)
+            else:
+                await bot.send_message(callback.from_user.id, text)
+            return
+        sent = False
+        if callback.message:
+            sent = await send_content_by_record(callback.message, content)
+        else:
+            try:
+                if content.file_type == "video":
+                    await bot.send_video(
+                        chat_id=callback.from_user.id,
+                        video=content.file_id,
+                        caption=content.caption,
+                    )
+                    sent = True
+                elif content.file_type == "document":
+                    await bot.send_document(
+                        chat_id=callback.from_user.id,
+                        document=content.file_id,
+                        caption=content.caption,
+                    )
+                    sent = True
+                else:
+                    await bot.send_message(
+                        callback.from_user.id,
+                        "⚠️ Saqlangan kontent turi qo'llab-quvvatlanmaydi.",
+                    )
+            except (TelegramBadRequest, TelegramForbiddenError):
+                await bot.send_message(
+                    callback.from_user.id,
+                    "🚫 Kontentni yuborib bo'lmadi. Bot ruxsatlari yoki fayl holatini tekshirib ko'ring.",
+                )
+
+        if sent:
+            await db.set_pending_code(user_id=callback.from_user.id, code=None)
+            if callback.message:
+                try:
+                    await callback.message.edit_reply_markup(reply_markup=None)
+                except TelegramBadRequest:
+                    pass
+        return
+
+    text = "🎉 Ajoyib, obuna tasdiqlandi!\n\nEndi kodni yuboring va kontentni oling."
     if callback.message:
         await callback.message.answer(text)
+        try:
+            await callback.message.edit_reply_markup(reply_markup=None)
+        except TelegramBadRequest:
+            pass
     else:
         await bot.send_message(callback.from_user.id, text)

@@ -1,15 +1,23 @@
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 import logging
 
 from aiogram import Bot
 from aiogram.enums.chat_member_status import ChatMemberStatus
-from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
+from aiogram.exceptions import (
+    TelegramBadRequest,
+    TelegramForbiddenError,
+    TelegramNetworkError,
+    TelegramRetryAfter,
+)
 
 from app.db import ChannelItem, Database
 
 logger = logging.getLogger(__name__)
+
+CHAT_MEMBER_TIMEOUT_SECONDS = 8.0
 
 ALLOWED_STATUSES = {
     ChatMemberStatus.MEMBER,
@@ -43,12 +51,53 @@ async def check_user_subscriptions(
 
     missing: list[ChannelItem] = []
     inaccessible: list[ChannelItem] = []
+    requested_chat_ids = await db.list_join_request_chat_ids(user_id)
 
     for channel in channels:
         try:
-            member = await bot.get_chat_member(chat_id=channel.chat_id, user_id=user_id)
-            if member.status not in ALLOWED_STATUSES:
-                missing.append(channel)
+            try:
+                member = await asyncio.wait_for(
+                    bot.get_chat_member(chat_id=channel.chat_id, user_id=user_id),
+                    timeout=CHAT_MEMBER_TIMEOUT_SECONDS,
+                )
+            except TelegramRetryAfter as exc:
+                # Telegram rate-limit bo'lsa biroz kutib, yana bir marta urinib ko'ramiz.
+                await asyncio.sleep(min(float(getattr(exc, "retry_after", 1)), 5.0))
+                member = await asyncio.wait_for(
+                    bot.get_chat_member(chat_id=channel.chat_id, user_id=user_id),
+                    timeout=CHAT_MEMBER_TIMEOUT_SECONDS,
+                )
+            if member.status in ALLOWED_STATUSES:
+                continue
+            if member.status == ChatMemberStatus.LEFT and channel.chat_id in requested_chat_ids:
+                # Private chatlarda "Join Request" yuborilgan bo'lsa ham a'zo bo'lmagan hisoblanadi,
+                # lekin kontent ochish uchun yetarli deb qabul qilamiz.
+                continue
+            missing.append(channel)
+        except asyncio.TimeoutError as exc:
+            logger.warning(
+                "get_chat_member timeout | chat_id=%s user_id=%s error=%s",
+                channel.chat_id,
+                user_id,
+                exc,
+            )
+            inaccessible.append(channel)
+        except TelegramNetworkError as exc:
+            logger.warning(
+                "get_chat_member network error | chat_id=%s user_id=%s error=%s",
+                channel.chat_id,
+                user_id,
+                exc,
+            )
+            inaccessible.append(channel)
+        except TelegramRetryAfter as exc:
+            logger.warning(
+                "get_chat_member rate limit | chat_id=%s user_id=%s error=%s",
+                channel.chat_id,
+                user_id,
+                exc,
+            )
+            inaccessible.append(channel)
         except (TelegramBadRequest, TelegramForbiddenError) as exc:
             # Bot chatga kira olmasa (ko'pincha bot admin emas / chat topilmaydi),
             # tekshiruvni ishonchli yakunlab bo'lmaydi.
@@ -89,6 +138,14 @@ def build_subscription_message(
             lines.append(f"🔒 {index}. {title} (private kanal)")
     channels_text = "\n".join(lines)
 
+    join_request_note = ""
+    if any(not (channel.username or "").strip() for channel in channels):
+        join_request_note = (
+            "\n\n"
+            "ℹ️ Private kanal/guruhda \"Request\" chiqsa, \"Request\" yuboring — "
+            "tasdiqni kutmasdan kontent ochiladi."
+        )
+
     inaccessible_text = ""
     if inaccessible_channels:
         warn_lines: list[str] = []
@@ -122,6 +179,8 @@ def build_subscription_message(
                 "Shu sabab obunani tekshirib bo'lmadi. Admin botni o'sha chatga admin qilib qo'ysin:\n\n"
                 f"{inaccessible_text}"
             )
+        if join_request_note:
+            text += join_request_note
         return text
 
     return (
@@ -138,4 +197,5 @@ def build_subscription_message(
             if inaccessible_text
             else ""
         )
+        + (join_request_note if join_request_note else "")
     )

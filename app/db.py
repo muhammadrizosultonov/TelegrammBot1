@@ -130,7 +130,18 @@ class Database:
                 )
                 """
             )
+            await db.execute(
+                """
+                CREATE TABLE IF NOT EXISTS join_requests (
+                    chat_id INTEGER NOT NULL,
+                    user_id INTEGER NOT NULL,
+                    requested_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (chat_id, user_id)
+                )
+                """
+            )
             await self._ensure_column(db, "channels", "invite_link", "TEXT")
+            await self._ensure_column(db, "users", "pending_code", "TEXT")
             await db.commit()
 
     async def upsert_content(
@@ -226,6 +237,34 @@ class Database:
             for row in rows
         ]
 
+    async def has_channel(self, chat_id: int) -> bool:
+        async with aiosqlite.connect(self.path) as db:
+            await self._apply_pragmas(db)
+            cursor = await db.execute("SELECT 1 FROM channels WHERE chat_id = ? LIMIT 1", (chat_id,))
+            row = await cursor.fetchone()
+        return row is not None
+
+    async def upsert_join_request(self, chat_id: int, user_id: int, requested_at: str | None = None) -> None:
+        async with aiosqlite.connect(self.path) as db:
+            await self._apply_pragmas(db)
+            await db.execute(
+                """
+                INSERT INTO join_requests (chat_id, user_id, requested_at)
+                VALUES (?, ?, COALESCE(?, CURRENT_TIMESTAMP))
+                ON CONFLICT(chat_id, user_id) DO UPDATE SET
+                    requested_at=excluded.requested_at
+                """,
+                (chat_id, user_id, requested_at),
+            )
+            await db.commit()
+
+    async def list_join_request_chat_ids(self, user_id: int) -> set[int]:
+        async with aiosqlite.connect(self.path) as db:
+            await self._apply_pragmas(db)
+            cursor = await db.execute("SELECT chat_id FROM join_requests WHERE user_id = ?", (user_id,))
+            rows = await cursor.fetchall()
+        return {int(row[0]) for row in rows}
+
     async def touch_user(self, user_id: int, username: str | None, full_name: str | None) -> None:
         async with aiosqlite.connect(self.path) as db:
             await self._apply_pragmas(db)
@@ -241,6 +280,34 @@ class Database:
                 (user_id, username, full_name),
             )
             await db.commit()
+
+    async def set_pending_code(self, user_id: int, code: str | None) -> None:
+        async with aiosqlite.connect(self.path) as db:
+            await self._apply_pragmas(db)
+            await db.execute(
+                """
+                INSERT INTO users (user_id, pending_code)
+                VALUES (?, ?)
+                ON CONFLICT(user_id) DO UPDATE SET
+                    pending_code=excluded.pending_code,
+                    last_seen=CURRENT_TIMESTAMP
+                """,
+                (user_id, code),
+            )
+            await db.commit()
+
+    async def get_pending_code(self, user_id: int) -> str | None:
+        async with aiosqlite.connect(self.path) as db:
+            await self._apply_pragmas(db)
+            cursor = await db.execute("SELECT pending_code FROM users WHERE user_id = ?", (user_id,))
+            row = await cursor.fetchone()
+        if not row:
+            return None
+        value = row[0]
+        if value is None:
+            return None
+        text = str(value).strip()
+        return text or None
 
     async def list_user_ids(self) -> list[int]:
         async with aiosqlite.connect(self.path) as db:
